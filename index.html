@@ -771,8 +771,120 @@ function handleNet(msg) {
             break;
         case 'start':
             net.mySide = msg.side; net.mode = msg.mode;
+            if (msg.stage && STAGES[msg.stage]) currentStageKey = msg.stage;
             applyOpponent(msg.opponent);
             launchOnlineMatch();
+            break;
+        case 'loaded':
+            if (net.mySide === msg.from) { /* recibido propio ack */ return; }
+            if (net.gotLoaded) return; else net.gotLoaded = true;
+            netSend({ t: 'loaded', from: net.mySide });
+            break;
+        case 'go':
+            if (gameRunning) { gameRunning = true; paused = false; requestAnimationFrame(animate); }
+            break;
+        case 'snap':
+            if (net && msg.s) {
+                const s = msg.s;
+                // Estado autoritativo del propio personaje (invitado): vida/ki/awaken/states.
+                // Se adopta del host para que ambos coincidan exactamente; NO se interpola
+                // la vida porque cualquier divergencia mínima ya es un bug de sincronía.
+                const applyOwnState = (f, data) => {
+                    if (!f || !data) return;
+                    if (data.health !== undefined) f.health = Math.max(0, data.health);
+                    if (data.ki !== undefined) f.ki = Math.max(0, Math.min(100, data.ki));
+                    if (data.awakenMeter !== undefined) f.awakenMeter = Math.max(0, Math.min(100, data.awakenMeter));
+                    if (data.isAwakened !== undefined) f.isAwakened = data.isAwakened;
+                    if (data.awakenTimeLeft !== undefined) f.awakenTimeLeft = data.awakenTimeLeft;
+                    if (data.isBlocking !== undefined) f.isBlocking = data.isBlocking;
+                    if (data.isCharging !== undefined) f.isCharging = data.isCharging;
+                    if (data.isDashing !== undefined) f.isDashing = data.isDashing;
+                    if (data.isFlying !== undefined) f.isFlying = data.isFlying;
+                    if (data.isAttacking !== undefined) f.isAttacking = data.isAttacking;
+                    if (data.attackTimer !== undefined) f.attackTimer = data.attackTimer;
+                    if (data.invulnerableFrames !== undefined) f.invulnerableFrames = data.invulnerableFrames;
+                    if (data.isGrounded !== undefined) f.isGrounded = data.isGrounded;
+                };
+                // Interpolación de estados de ambos fighters + proyectiles
+                const applyFighter = (f, data) => {
+                    if (!f || !data) return;
+                    // Posición con interpolación suave (factor 0.25 por paso) para evitar saltos visibles
+                    if (data.x !== undefined && data.y !== undefined) {
+                        f.x += (data.x - f.x) * 0.25;
+                        f.y += (data.y - f.y) * 0.25;
+                    }
+                    f.vx = data.vx !== undefined ? (f.vx + (data.vx - f.vx) * 0.3) : f.vx;
+                    f.vx = data.vx !== undefined ? data.vx : f.vx;
+                    f.vy = data.vy !== undefined ? data.vy : f.vy;
+                    // Vida / ki / estados críticos (sin interpolación, reemplazo directo para evitar desync)
+                    if (data.health !== undefined) f.health = Math.max(0, data.health);
+                    if (data.ki !== undefined) f.ki = Math.max(0, Math.min(100, data.ki));
+                    if (data.isAwakened !== undefined) f.isAwakened = data.isAwakened;
+                    if (data.awakenTimeLeft !== undefined) f.awakenTimeLeft = data.awakenTimeLeft;
+                    if (data.isBlocking !== undefined) f.isBlocking = data.isBlocking;
+                    if (data.isCharging !== undefined) f.isCharging = data.isCharging;
+                    if (data.isDashing !== undefined) f.isDashing = data.isDashing;
+                    if (data.isFlying !== undefined) f.isFlying = data.isFlying;
+                    if (data.isAttacking !== undefined) f.isAttacking = data.isAttacking;
+                    if (data.attackTimer !== undefined) f.attackTimer = data.attackTimer;
+                    if (data.invulnerableFrames !== undefined) f.invulnerableFrames = data.invulnerableFrames;
+                    if (data.facingRight !== undefined) f.facingRight = data.facingRight;
+                    if (data.isGrounded !== undefined) f.isGrounded = data.isGrounded;
+                };
+                // Aplicar a remote fighter según lado
+                if (net.mySide === 'p2' && s.p1) applyFighter(player1, s.p1);
+                if (net.mySide === 'p1' && s.p2) applyFighter(player2, s.p2);
+                // El host es la autoridad: el invitado adopta vida/ki/estados de SU propio
+                // personaje desde el snapshot (si no, su vida diverge al recibir daño).
+                if (net.mySide === 'p2' && s.p2) applyOwnState(player2, s.p2);
+                if (net.mySide === 'p1' && s.p1) applyOwnState(player1, s.p1);
+                // Sincronizar proyectiles (reemplazar array completo para evitar desync en vida/impactos)
+                if (s.projectiles && Array.isArray(s.projectiles)) {
+                    projectiles = s.projectiles.map(p => {
+                        // Reconstruir proyectil desde datos serializados
+                        const proj = new Projectile(p.x, p.y, p.vx, p.color || '#fff', p.owner === 'p1' ? player1 : player2, !!p.isUltimate, p.ultType || 'normal');
+                        proj.time = p.time || 0;
+                        proj.width = p.width || proj.width;
+                        proj.height = p.height || proj.height;
+                        return proj;
+                    });
+                }
+                // Sincronizar efectos del host (screenShake, impactos visuales aproximados)
+                if (s.screenShake !== undefined && s.screenShake > 0.5) {
+                    screenShake = Math.min(s.screenShake, 25);
+                }
+                // Impactos del host: se reproducen en el invitado (partículas del rival)
+                if (s.impacts && Array.isArray(s.impacts)) {
+                    for (const ev of s.impacts) {
+                        if (!ev) continue;
+                        const key = ev.ts + ':' + Math.round(ev.x) + ':' + Math.round(ev.y);
+                        if (net.lastImpactKeys && net.lastImpactKeys.has(key)) continue;
+                        if (!net.lastImpactKeys) net.lastImpactKeys = new Set();
+                        net.lastImpactKeys.add(key);
+                        if (net.lastImpactKeys.size > 40) net.lastImpactKeys = new Set(Array.from(net.lastImpactKeys).slice(-20));
+                        // Solo partículas: no vuelve a aplicar daño (ya lo hizo el host)
+                        for (let i = 0; i < (ev.count || 15); i++) spawnParticle(ev.x, ev.y, ev.color || '#fff', 8);
+                    }
+                }
+                // Sincronizar timer si hay desviación
+                if (s.simTick !== undefined && simTickCounter > 0) {
+                    const expectedTicks = s.simTick;
+                    if (Math.abs(simTickCounter - expectedTicks) > 60) {
+                        simTickCounter = expectedTicks;
+                    }
+                }
+                if (msg.ts && msg.ts > 0) {
+                    // Ajuste menor del timer visual según tick recibido
+                    const tickDiff = Math.round((msg.ts / 1000) * 60);
+                    if (simTimeRemaining > 0 && tickDiff > 0) {
+                        simTimeRemaining = Math.max(0, Math.round(ROUND_TIME - tickDiff / 60));
+                        document.getElementById('timer').innerText = Math.max(0, Math.ceil(simTimeRemaining / 60));
+                    }
+                }
+            }
+            break;
+        case 'over':
+            if (gameRunning) endGame(msg.result === 'draw' ? '¡EMPATE!' : msg.result === 'p1' ? `¡${player1.name.toUpperCase()} GANA!` : `¡${player2.name.toUpperCase()} GANA!`, msg.result);
             break;
         case 'hb': break;
         case 'in': net.remoteHeld = msg.m; break;
@@ -816,6 +928,7 @@ function sendReady() {
     myReadySent = true;
     const btn = document.getElementById('ol-listobtn'); if (btn) btn.disabled = true;
     showOnlineMsg('LISTO ✔ — esperando a tu rival…', true);
+    net.gotLoaded = false;
 }
 function launchOnlineMatch() {
     const myChar = ROSTER[myOnlineChar] ? myOnlineChar : 'goku';
@@ -869,6 +982,17 @@ function initAccount() { refreshMe(); buildOnlineRoster(); }
 let paused = false;
 let muted = false;
 try { if (localStorage.getItem(LS_STORAGE.mute) === '1') muted = true; } catch (e) {}
+
+// ==== STEP SYSTEM: lógica en pasos de 1/60 s ====
+// Cada tick = 1/60 seg, se repite hasta completar la cantidad acumulada
+// y resprena hasta 4 pasos / frame para evitar la espiral de la muerte
+const FIXED_DT = 1 / 60;                 // tamaño de un lógico-tick (segundos)
+const TICK_FPS = 60;                     // pulses de lógica por segundo
+const MAX_STEPS_PER_FRAME = 4;           // protección contra la caída de frames
+const SNAPSHOT_INTERVAL_MS = 50;         // snapshot del host ~20 fps (para Fase B)
+let accumulator = 0;                      // tiempo acumulado de rAF -> lógica
+let lastFrameTime = null;                // timestamp anterior para calcular delta
+let simTickCounter = 0;                  // total de ticks de simulación corridos
 
 function togglePause() {
     if (!gameRunning || gameMode === 'online') return;
@@ -1637,7 +1761,10 @@ function spawnParticle(x, y, color, speed = 8, isFlightDust = false) {
     const p = particlePool.find(p => !p.active);
     if (p) p.spawn(x, y, color, speed, isFlightDust);
 }
+let impactEvents = []; // eventos de impacto para sincronización host->guest
 function createImpact(x, y, color, count = 15, speed = 8) {
+    impactEvents.push({x,y,color,count,ts:Date.now()});
+    if (impactEvents.length > 8) impactEvents = impactEvents.slice(-8); // límite pequeño
     for (let i = 0; i < count; i++) spawnParticle(x, y, color, speed);
 }
 
@@ -2116,7 +2243,7 @@ class Fighter {
         ctx.restore();
     }
 
-    update() {
+    stepPhysics() {
         if (this.isAwakened) {
             this.awakenTimeLeft--;
             if (this.health < this.maxHealth) this.health = Math.min(this.maxHealth, this.health + AWAKEN_REGEN);
@@ -2126,48 +2253,42 @@ class Fighter {
             }
             if (this.awakenTimeLeft <= 0) this.endAwaken();
         }
-
         if (this.isCharging) {
-            if (this.ki < 100) this.ki += 0.8;
+            if (this.ki < 100) this.ki += FIXED_DT * 0.8 * 60;
             if (this.ki > 100) this.ki = 100;
             if (Math.random() > 0.3) spawnParticle(this.x + Math.random()*this.width, this.y + this.height, this.kiColor, 3, true);
         }
-
         if (this.isDashing) {
             if (this.dashTimer % 2 === 0) this.ghosts.push({x: this.x, y: this.y, facingRight: this.facingRight, alpha: 0.6});
-            this.dashTimer--; this.vx = 22 * this.dashDir; this.facingRight = this.dashDir === 1; 
+            this.dashTimer--; this.vx = 22 * this.dashDir; this.facingRight = this.dashDir === 1;
             if (this.dashTimer <= 0) this.isDashing = false;
         }
-
         for (let i = this.ghosts.length - 1; i >= 0; i--) {
-            this.ghosts[i].alpha -= 0.08; if (this.ghosts[i].alpha <= 0) this.ghosts.splice(i, 1);
+            this.ghosts[i].alpha -= FIXED_DT * 60;
+            if (this.ghosts[i].alpha <= 0) this.ghosts.splice(i, 1);
         }
-
         if (this.attackTimer > 0) this.attackTimer--;
         if (this.attackTimer <= 0 && this.isAttacking) this.isAttacking = false;
-
         if (this.invulnerableFrames > 0) this.invulnerableFrames--;
         if (!this.isBlocking && !this.isCharging) this.x += this.vx;
-        
         if (this.isFlying) {
-            if (!this.isDashing && !this.isCharging) this.ki -= 0.08; 
+            if (!this.isDashing && !this.isCharging) this.ki -= FIXED_DT * 0.08 * 60;
             if (this.ki <= 0) { this.ki = 0; this.isFlying = false; }
-            this.y += this.vy; this.vy *= 0.85; 
+            this.y += this.vy; this.vy *= 0.85;
         } else {
             this.vy += this.isDashing ? GRAVITY * 0.2 : GRAVITY; this.y += this.vy;
         }
-
         if (this.y + this.height >= FLOOR_Y) {
             this.y = FLOOR_Y - this.height; this.vy = 0; this.isGrounded = true;
-            if (this.isFlying) this.isFlying = false; 
+            if (this.isFlying) this.isFlying = false;
         } else { this.isGrounded = false; }
-
-        if (this.y < 10) { this.y = 10; this.vy = 0; } 
+        if (this.y < 10) { this.y = 10; this.vy = 0; }
         if (this.x < 0) { this.x = 0; this.vx = 0; }
         if (this.x + this.width > canvas.width) { this.x = canvas.width - this.width; this.vx = 0; }
-        if (this.ki < 100 && !this.isFlying && !this.isDashing && !this.isCharging) this.ki += 0.2; 
-        this.draw();
+        if (this.ki < 100 && !this.isFlying && !this.isDashing && !this.isCharging) this.ki += FIXED_DT * 0.2 * 60;
     }
+
+    update() { this.stepPhysics(); this.draw(); }
 
     attack() {
         if (!this.isAttacking && !this.isBlocking && !this.isCharging && this.attackTimer <= 0) {
@@ -2193,6 +2314,9 @@ class Fighter {
 let player1, player2, projectiles = [];
 let time = 90, timerInterval;
 let ROUND_TIME = 90;
+let simTimeRemaining = 90;
+let hiddenSince = null;
+let lastTraffic = Date.now(); // ticks de simulación (~1 tick = 1/60s, 90s = 5400 ticks)
 
 function startMatch(p1Char, p2Char) {
     document.getElementById('select-screen').style.display = 'none';
@@ -2238,15 +2362,15 @@ function startMatch(p1Char, p2Char) {
     const cpuBadge = document.getElementById('cpu-badge');
     cpuBadge.style.display = (gameMode === 'bot' || gameMode === 'online') ? 'inline' : 'none';
     cpuBadge.innerText = (gameMode === 'online') ? ((net && net.mode === 'ranked') ? 'RANKED' : 'AMISTOSA') : 'CPU';
-    
-    time = ROUND_TIME; gameRunning = false;
+
+    simTimeRemaining = ROUND_TIME; // resetear contador en ticks de simulación
+    document.getElementById('timer').innerText = simTimeRemaining;
+    // Display calculado: simTimeRemaining / TICK_FPS segundos (aprox.)
     const saveStatusEl = document.getElementById('save-status');
     if (saveStatusEl) saveStatusEl.innerText = '';
     paused = false;
     document.getElementById('pause-overlay').style.display = 'none';
     const timerEl = document.getElementById('timer');
-    timerEl.innerText = time;
-    timerEl.classList.remove('timer-low');
 
     clearInterval(timerInterval);
 
@@ -2258,18 +2382,7 @@ function startMatch(p1Char, p2Char) {
 
     runCountdown(() => {
         gameRunning = true;
-        timerInterval = setInterval(() => {
-            if (time > 0 && gameRunning) {
-                time--; timerEl.innerText = time;
-                if (time <= 10) timerEl.classList.add('timer-low'); else timerEl.classList.remove('timer-low');
-            }
-            else if (time === 0 && gameRunning) {
-                if (player1.health === player2.health) endGame('¡TIME OVER — EMPATE!', 'draw');
-                else if (player1.health > player2.health) endGame(`¡TIME OVER — ${player1.name.toUpperCase()} GANA!`, 'p1');
-                else endGame(`¡TIME OVER — ${player2.name.toUpperCase()} GANA!`, 'p2');
-            }
-        }, 1000);
-        animate();
+        animate(); // inicia el bucle fijo con timer en sim ticks
     });
 }
 
@@ -2793,94 +2906,379 @@ function handleCollisions() {
 function animate() {
     if (!gameRunning) return;
     if (paused) return; // bucle congelado: no se pide el siguiente frame
-    requestAnimationFrame(animate);
 
-    ctx.save();
-    if (screenShake > 0.5) { ctx.translate((Math.random() - 0.5) * screenShake, (Math.random() - 0.5) * screenShake); screenShake *= 0.88; }
-    ctx.clearRect(0, 0, canvas.width, canvas.height); drawStage();
+    // ============ STEP SYSTEM ============
+    // 1. Calcular delta desde el último frame
+    const now = performance.now() / 1000; // segundos
+    const delta = lastFrameTime !== null ? Math.max(0, now - lastFrameTime) : 0;
+    lastFrameTime = now;
 
-    player1.update(); player2.update();
+    // 2. Acumular tiempo y ejecutar tantos pasos completos como podamos (máx 4 / frame)
+    accumulator += delta;
+    const maxSteps = Math.min(Math.floor(accumulator / FIXED_DT), MAX_STEPS_PER_FRAME);
+    for (let step = 0; step < maxSteps; step++) {
+        accumulator -= FIXED_DT;
+        simTickCounter++;
 
-    const p1H = Math.max(0, (player1.health / player1.maxHealth) * 100);
-    HUD.p1Health.style.width = p1H + '%';
-    HUD.p1HealthBg.style.width = p1H + '%';
-    HUD.p1Ki.style.width = Math.max(0, player1.ki) + '%';
+        // ----- Fighter 1: lógica local / remota -----(
+        if (!isRemote(1)) {
+            // Input local (ya existente)
+        if (!isRemote(1)) {
+            // Input local: movimiento, carga, bloqueo, ataque, ki, volar, awaken, dash
+            if (!player1.isDashing) {
+                player1.vx = 0;
+                player1.isBlocking = keys['KeyS'];
+                player1.isCharging = keys['KeyC'] && !player1.isBlocking;
+                if (player1.isCharging) {
+                    if (player1.ki < 100) player1.ki += FIXED_DT * 0.8 * 60; // escalado a paso fijo
+                    if (player1.ki > 100) player1.ki = 100;
+                } else {
+                    if (keys['KeyA'] && !player1.isBlocking) { player1.vx = -player1.speed; player1.facingRight = false; }
+                    if (keys['KeyD'] && !player1.isBlocking) { player1.vx = player1.speed; player1.facingRight = true; }
+                }
+            } else { player1.isBlocking = false; player1.isCharging = false; }
 
-    const p2H = Math.max(0, (player2.health / player2.maxHealth) * 100);
-    HUD.p2Health.style.width = p2H + '%';
-    HUD.p2HealthBg.style.width = p2H + '%';
-    HUD.p2Ki.style.width = Math.max(0, player2.ki) + '%';
+            if (player1.isFlying && !player1.isDashing && !player1.isCharging) {
+                if (keys['KeyW']) player1.vy = -4.5; if (keys['KeyS']) player1.vy = 4.5;
+            } else if (!player1.isDashing && !player1.isCharging) {
+                if (keys['KeyW'] && player1.isGrounded && !player1.isBlocking) { player1.vy = player1.jumpStrength; playSound('jump'); }
+            }
 
-    updateAwakenHUD(player1, 'p1'); updateAwakenHUD(player2, 'p2');
+            // Ataques simples (single press)
+            handleSinglePress('KeyR', () => { player1.toggleFly(); });
+            if (keys['KeyF']) player1.attack();
+            handleSinglePress('KeyE', () => { player1.shootKi(projectiles, false); });
+            handleSinglePress('KeyQ', () => { player1.shootKi(projectiles, true); });
+            handleSinglePress('KeyT', () => { player1.activateAwaken(); });
 
-    if (isRemote(1)) {
-        applyRemoteTo(player1);
-    } else {
-        if (!player1.isDashing) {
-            player1.vx = 0; player1.isBlocking = keys['KeyS']; player1.isCharging = keys['KeyC'] && !player1.isBlocking;
+            // Update con acumulación de awaken, dash, etc.
+            if (player1.isAwakened) {
+                player1.awakenTimeLeft--;
+                if (player1.health < player1.maxHealth) player1.health = Math.min(player1.maxHealth, player1.health + AWAKEN_REGEN);
+                if (Math.random() > 0.55) {
+                    const auraColor = (AWAKEN_DATA[player1.charKey] && AWAKEN_DATA[player1.charKey].aura) || player1.kiColor;
+                    spawnParticle(player1.x + Math.random()*player1.width, player1.y + player1.height - Math.random()*10, auraColor, 4, true);
+                }
+                if (player1.awakenTimeLeft <= 0) player1.endAwaken();
+            }
+
             if (player1.isCharging) {
-                if (player1.ki < 100 && Math.random() > 0.8) playSound('charge');
-            } else {
-                if (keys['KeyA'] && !player1.isBlocking) { player1.vx = -player1.speed; player1.facingRight = false; }
-                if (keys['KeyD'] && !player1.isBlocking) { player1.vx = player1.speed; player1.facingRight = true; }
+                if (player1.ki < 100) player1.ki += FIXED_DT * 0.8 * 60;
+                if (player1.ki > 100) player1.ki = 100;
+                if (Math.random() > 0.3) spawnParticle(player1.x + Math.random()*player1.width, player1.y + player1.height, player1.kiColor, 3, true);
             }
-        } else { player1.isBlocking = false; player1.isCharging = false; }
 
-        if (player1.isFlying && !player1.isDashing && !player1.isCharging) {
-            if (keys['KeyW']) player1.vy = -4.5; if (keys['KeyS']) player1.vy = 4.5;
-        } else if (!player1.isDashing && !player1.isCharging) {
-            if (keys['KeyW'] && player1.isGrounded && !player1.isBlocking) { player1.vy = player1.jumpStrength; playSound('jump'); }
+            if (player1.isDashing) {
+                if (player1.dashTimer % 2 === 0) player1.ghosts.push({x: player1.x, y: player1.y, facingRight: player1.facingRight, alpha: 0.6});
+                player1.dashTimer--; player1.vx = 22 * player1.dashDir; player1.facingRight = player1.dashDir === 1;
+                if (player1.dashTimer <= 0) player1.isDashing = false;
+            }
+
+            for (let i = player1.ghosts.length - 1; i >= 0; i--) {
+                player1.ghosts[i].alpha -= FIXED_DT * 60; // escalado
+                if (player1.ghosts[i].alpha <= 0) player1.ghosts.splice(i, 1);
+            }
+        } else {
+            // Cliente remoto: aplicar snapshot / interpolación al fighter
+            // (lo llenaremos en la Fase B, aquí dejamos applyRemoteTo ligero)
+            if (net && net.remoteHeld !== undefined && net.mySide !== 'p1') {
+                // Aplicar inputs remotos simples por tick para que el fighter no se congele
+                const m = net.remoteHeld;
+                const left = (m & 1) !== 0, right = (m & 2) !== 0, up = (m & 4) !== 0;
+                const down = (m & 8) !== 0, charge = (m & 16) !== 0, attack = (m & 32) !== 0;
+
+                if (!player1.isDashing) {
+                    player1.vx = 0; player1.isBlocking = down; player1.isCharging = charge && !down;
+                    if (!player1.isCharging) {
+                        if (left && !player1.isBlocking) { player1.vx = -player1.speed; player1.facingRight = false; }
+                        if (right && !player1.isBlocking) { player1.vx = player1.speed; player1.facingRight = true; }
+                    }
+                } else { player1.isBlocking = false; player1.isCharging = false; }
+
+                if (player1.isFlying && !player1.isDashing && !player1.isCharging) {
+                    if (up) player1.vy = -4.5; if (down) player1.vy = 4.5;
+                } else if (!player1.isDashing && !player1.isCharging) {
+                    if (up && player1.isGrounded && !player1.isBlocking) { player1.vy = player1.jumpStrength; }
+                }
+
+                if (attack) player1.attack();
+
+                while (net.actionQueue.length) {
+                    const a = net.actionQueue.shift();
+                    if (a === 'ki') player1.shootKi(projectiles, false);
+                    else if (a === 'ult') player1.shootKi(projectiles, true);
+                    else if (a === 'fly') player1.toggleFly();
+                    else if (a === 'awaken') player1.activateAwaken();
+                    else if (a === 'dashL') player1.triggerDash(-1);
+                    else if (a === 'dashR') player1.triggerDash(1);
+                }
+            }
         }
 
-        handleSinglePress('KeyR', () => { player1.toggleFly(); sendAct('fly'); });
-        if (keys['KeyF']) player1.attack();
-        handleSinglePress('KeyE', () => { player1.shootKi(projectiles, false); sendAct('ki'); });
-        handleSinglePress('KeyQ', () => { player1.shootKi(projectiles, true); sendAct('ult'); });
-        handleSinglePress('KeyT', () => { player1.activateAwaken(); sendAct('awaken'); });
-    }
+        // ----- Fighter 2: lógica similar -----
+        if (!isRemote(2)) {
+            if (!player2.isDashing) {
+                player2.vx = 0;
+                player2.isBlocking = keys['ArrowDown'];
+                player2.isCharging = keys['KeyI'] && !player2.isBlocking;
+                if (player2.isCharging) {
+                    if (player2.ki < 100) player2.ki += FIXED_DT * 0.8 * 60;
+                    if (player2.ki > 100) player2.ki = 100;
+                } else {
+                    if (keys['ArrowLeft'] && !player2.isBlocking) { player2.vx = -player2.speed; player2.facingRight = false; }
+                    if (keys['ArrowRight'] && !player2.isBlocking) { player2.vx = player2.speed; player2.facingRight = true; }
+                }
+            } else { player2.isBlocking = false; player2.isCharging = false; }
 
-    if (gameMode === 'bot') {
-        runBotAI();
-    } else if (isRemote(2)) {
-        applyRemoteTo(player2);
-    } else {
-        if (!player2.isDashing) {
-            player2.vx = 0; player2.isBlocking = keys['ArrowDown']; player2.isCharging = keys['KeyI'] && !player2.isBlocking;
+            if (player2.isFlying && !player2.isDashing && !player2.isCharging) {
+                if (keys['ArrowUp']) player2.vy = -4.5; if (keys['ArrowDown']) player2.vy = 4.5;
+            } else if (!player2.isDashing && !player2.isCharging) {
+                if (keys['ArrowUp'] && player2.isGrounded && !player2.isBlocking) { player2.vy = player2.jumpStrength; playSound('jump'); }
+            }
+
+            handleSinglePress('KeyO', () => { player2.toggleFly(); });
+            if (keys['KeyK']) player2.attack();
+            handleSinglePress('KeyL', () => { player2.shootKi(projectiles, false); });
+            handleSinglePress('KeyU', () => { player2.shootKi(projectiles, true); });
+            handleSinglePress('KeyP', () => { player2.activateAwaken(); });
+
+            if (player2.isAwakened) {
+                player2.awakenTimeLeft--;
+                if (player2.health < player2.maxHealth) player2.health = Math.min(player2.maxHealth, player2.health + AWAKEN_REGEN);
+                if (Math.random() > 0.55) {
+                    const auraColor = (AWAKEN_DATA[player2.charKey] && AWAKEN_DATA[player2.charKey].aura) || player2.kiColor;
+                    spawnParticle(player2.x + Math.random()*player2.width, player2.y + player2.height - Math.random()*10, auraColor, 4, true);
+                }
+                if (player2.awakenTimeLeft <= 0) player2.endAwaken();
+            }
+
             if (player2.isCharging) {
-                if (player2.ki < 100 && Math.random() > 0.8) playSound('charge');
-            } else {
-                if (keys['ArrowLeft'] && !player2.isBlocking) { player2.vx = -player2.speed; player2.facingRight = false; }
-                if (keys['ArrowRight'] && !player2.isBlocking) { player2.vx = player2.speed; player2.facingRight = true; }
+                if (player2.ki < 100) player2.ki += FIXED_DT * 0.8 * 60;
+                if (player2.ki > 100) player2.ki = 100;
+                if (Math.random() > 0.3) spawnParticle(player2.x + Math.random()*player2.width, player2.y + player2.height, player2.kiColor, 3, true);
             }
-        } else { player2.isBlocking = false; player2.isCharging = false; }
 
-        if (player2.isFlying && !player2.isDashing && !player2.isCharging) {
-            if (keys['ArrowUp']) player2.vy = -4.5; if (keys['ArrowDown']) player2.vy = 4.5;
-        } else if (!player2.isDashing && !player2.isCharging) {
-            if (keys['ArrowUp'] && player2.isGrounded && !player2.isBlocking) { player2.vy = player2.jumpStrength; playSound('jump'); }
+            if (player2.isDashing) {
+                if (player2.dashTimer % 2 === 0) player2.ghosts.push({x: player2.x, y: player2.y, facingRight: player2.facingRight, alpha: 0.6});
+                player2.dashTimer--; player2.vx = 22 * player2.dashDir; player2.facingRight = player2.dashDir === 1;
+                if (player2.dashTimer <= 0) player2.isDashing = false;
+            }
+
+            for (let i = player2.ghosts.length - 1; i >= 0; i--) {
+                player2.ghosts[i].alpha -= FIXED_DT * 60;
+                if (player2.ghosts[i].alpha <= 0) player2.ghosts.splice(i, 1);
+            }
+        } else {
+            // Cliente remoto: fighter 2
+            if (net && net.remoteHeld !== undefined && net.mySide !== 'p2') {
+                const m = net.remoteHeld;
+                const left = (m & 1) !== 0, right = (m & 2) !== 0, up = (m & 4) !== 0;
+                const down = (m & 8) !== 0, charge = (m & 16) !== 0, attack = (m & 32) !== 0;
+
+                if (!player2.isDashing) {
+                    player2.vx = 0; player2.isBlocking = down; player2.isCharging = charge && !down;
+                    if (!player2.isCharging) {
+                        if (left && !player2.isBlocking) { player2.vx = -player2.speed; player2.facingRight = false; }
+                        if (right && !player2.isBlocking) { player2.vx = player2.speed; player2.facingRight = true; }
+                    }
+                } else { player2.isBlocking = false; player2.isCharging = false; }
+
+                if (player2.isFlying && !player2.isDashing && !player2.isCharging) {
+                    if (up) player2.vy = -4.5; if (down) player2.vy = 4.5;
+                } else if (!player2.isDashing && !player2.isCharging) {
+                    if (up && player2.isGrounded && !player2.isBlocking) { player2.vy = player2.jumpStrength; }
+                }
+
+                if (attack) player2.attack();
+
+                while (net.actionQueue.length) {
+                    const a = net.actionQueue.shift();
+                    if (a === 'ki') player2.shootKi(projectiles, false);
+                    else if (a === 'ult') player2.shootKi(projectiles, true);
+                    else if (a === 'fly') player2.toggleFly();
+                    else if (a === 'awaken') player2.activateAwaken();
+                    else if (a === 'dashL') player2.triggerDash(-1);
+                    else if (a === 'dashR') player2.triggerDash(1);
+                }
+            }
         }
 
-        handleSinglePress('KeyO', () => { player2.toggleFly(); sendAct('fly'); });
-        if (keys['KeyK']) player2.attack();
-        handleSinglePress('KeyL', () => { player2.shootKi(projectiles, false); sendAct('ki'); });
-        handleSinglePress('KeyU', () => { player2.shootKi(projectiles, true); sendAct('ult'); });
-        handleSinglePress('KeyP', () => { player2.activateAwaken(); sendAct('awaken'); });
+        // ----- Física de fighters (tick fijo) -----
+        if (!isRemote(1)) player1.stepPhysics(); else { if (net && net.role==='guest') { /* snapshot interpolation futuro */ } }
+        if (!isRemote(2)) player2.stepPhysics(); else { if (net && net.role==='guest') { /* snapshot interpolation futuro */ } }
+
+        // ----- Projectiles -----
+        for (let i = projectiles.length - 1; i >= 0; i--) {
+            const p = projectiles[i];
+            p.x += p.vx; p.time += FIXED_DT * 60; // escalado
+            if (p.x < -200 || p.x > canvas.width + 200) { projectiles.splice(i, 1); continue; }
+            const target = p.owner === player1 ? player2 : player1;
+
+            if (p.x < target.x + target.width && p.x + p.width > target.x && p.y < target.y + target.height && p.y + p.height > target.y) {
+                if (target.invulnerableFrames > 0 && !p.isUltimate) continue;
+
+                // ---- Fase anti-desync: solo el host calcula daño real ----
+                // El invitado (guest) NO modifica vida/ki/invulnerableFrames localmente;
+                // usa los valores autoritativos que llegan en el snapshot del host.
+                // Solo aplica efectos visuales (partículas) y registra combo visual.
+                let dmgVisual = 0; // solo para efectos, no muta la vida real
+
+                let baseDmg = p.isUltimate ? 38 : 16;
+                if (p.ultType === 'supernova' || p.ultType === 'sandwich_throw') baseDmg = 45;
+                if (p.ultType === 'gerson_hammer' || p.ultType === 'super_arte_1' || p.ultType === 'tom_mallet' || p.ultType === 'jerry_cheese' || p.ultType === 'giant_carrot' || p.ultType === 'gumball_rainbow' || p.ultType === 'maletin_bomba') baseDmg = 46;
+
+                let dmg = target.isBlocking ? Math.floor(baseDmg * 0.25) : baseDmg;
+                if (p.ultType === 'makankosappo') dmg = baseDmg;
+
+                if (p.owner.isAwakened) dmg *= AWAKEN_DMG_MULT;
+                if (target.isAwakened) dmg *= AWAKEN_DEF_MULT;
+                dmg = Math.max(1, Math.round(dmg));
+
+                // ---- Anti-desync: la vida la decide el host ----
+                // Si el objetivo es el rival remoto, el host ya aplicó el daño real
+                // en su simulación; aquí solo efectos visuales (sin mutar vida/ki/frames).
+                const objetivoEsRemoto = isOnline() && net && (
+                    (net.mySide === 'p2' && target === player1) ||
+                    (net.mySide === 'p1' && target === player2)
+                );
+
+                if (!objetivoEsRemoto) {
+                    target.health -= dmg;
+                    if (!p.owner.isAwakened) p.owner.awakenMeter = Math.min(100, p.owner.awakenMeter + dmg * 0.6);
+                    target.x += (p.vx > 0 ? 1 : -1) * (target.isBlocking ? 10 : (p.isUltimate ? 50 : 25));
+                    if (!target.isBlocking) {
+                        target.invulnerableFrames = p.isUltimate ? 40 : 10;
+                        if (p.owner === player1) { p1ComboCount++; p1ComboTimer = 120; } else { p2ComboCount++; p2ComboTimer = 120; }
+                    }
+                } else {
+                    // Rival remoto: solo combo visual, sin tocar la vida (la pone el snapshot)
+                    if (!target.isBlocking) {
+                        if (p.owner === player1) { p1ComboCount++; p1ComboTimer = 120; } else { p2ComboCount++; p2ComboTimer = 120; }
+                    }
+                }
+                playSound(target.isBlocking && p.ultType !== 'makankosappo' ? 'block' : 'hit');
+                if (!target.isBlocking || p.ultType === 'makankosappo') screenShake = p.isUltimate ? 25 : 10;
+                // Impacto: solo el host crea la partícula; si soy invitado, no duplico (llega por snapshot como impacto)
+                const soyInvitado = isOnline() && net && net.mySide !== 'p1';
+                if (!soyInvitado || !isOnline() || !net || net.mySide === 'p1') {
+                    createImpact(target.x + target.width/2, p.y + p.height/2, p.color, p.isUltimate ? 50 : 20, p.isUltimate ? 18 : 10);
+                }
+                projectiles.splice(i, 1);
+            }
+        }
+
+        // ----- Collisions (melee) -----
+        const checkMelee = (att, def) => {
+            if (att.isAttacking) {
+                const atkX = att.facingRight ? att.x + att.width : att.x - att.attackBox.width;
+                if (attX < def.x + def.width && atkX + att.attackBox.width > def.x &&
+                    att.y + att.attackBox.offset.y < def.y + def.height && att.y + att.attackBox.offset.y + att.attackBox.height > def.y) {
+                    if (def.invulnerableFrames === 0 || def.isBlocking) {
+                        att.isAttacking = false;
+                        let dmg = def.isBlocking ? 2 : 8;
+                        if (att.isAwakened) dmg *= AWAKEN_DMG_MULT;
+                        if (def.isAwakened) dmg *= AWAKEN_DEF_MULT;
+                        dmg = Math.max(1, Math.round(dmg));
+                        def.health -= dmg;
+                        if (!att.isAwakened) att.awakenMeter = Math.min(100, att.awakenMeter + dmg * 0.9);
+                        def.x += (att.facingRight ? 1 : -1) * (def.isBlocking ? 5 : 20);
+                        if (!def.isBlocking) def.invulnerableFrames = 15;
+                        playSound(def.isBlocking ? 'block' : 'hit');
+                        createImpact(def.x + def.width/2, def.y + 20, def.isBlocking ? '#00ffff' : '#ffffff', 20);
+                        if (!def.isBlocking) {
+                            if (att === player1) { p1ComboCount++; p1ComboTimer = 120; } else { p2ComboCount++; p2ComboTimer = 120; }
+                        }
+                    }
+                }
+            }
+        };
+        checkMelee(player1, player2); checkMelee(player2, player1);
+
+        // ----- HUD updates -----
+        const p1H = Math.max(0, (player1.health / player1.maxHealth) * 100);
+        HUD.p1Health.style.width = p1H + '%';
+        HUD.p1HealthBg.style.width = p1H + '%';
+        HUD.p1Ki.style.width = Math.max(0, player1.ki) + '%';
+
+        const p2H = Math.max(0, (player2.health / player2.maxHealth) * 100);
+        HUD.p2Health.style.width = p2H + '%';
+        HUD.p2HealthBg.style.width = p2H + '%';
+        HUD.p2Ki.style.width = Math.max(0, player2.ki) + '%';
+
+        updateAwakenHUD(player1, 'p1'); updateAwakenHUD(player2, 'p2');
+
+        // ----- Draw -----
+        ctx.save();
+        if (screenShake > 0.5) { ctx.translate((Math.random() - 0.5) * screenShake, (Math.random() - 0.5) * screenShake); screenShake *= 0.88; }
+        ctx.clearRect(0, 0, canvas.width, canvas.height); drawStage();
+        player1.draw(); player2.draw();
+        drawCombos();
+        for (let i = 0; i < particlePool.length; i++) {
+            if (particlePool[i].active) { particlePool[i].update(); particlePool[i].draw(); }
+        }
+        ctx.restore();
+
+        // ----- Snapshot del host cada paso (Fase B completa + interpolación) -----
+        if (isOnline() && net.mySide === 'p1' && gameRunning && simTickCounter % 3 === 0) {
+            const serFighter = (f) => ({
+                x: f.x, y: f.y, vx: f.vx, vy: f.vy,
+                health: f.health, ki: f.ki, awakenMeter: f.awakenMeter,
+                isAwakened: f.isAwakened, awakenTimeLeft: f.awakenTimeLeft,
+                screenShake: (typeof screenShake !== 'undefined') ? screenShake : 0,
+                impacts: (typeof impactEvents !== 'undefined') ? impactEvents.slice(-5) : [],
+                isBlocking: f.isBlocking, isCharging: f.isCharging, isDashing: f.isDashing,
+                isFlying: f.isFlying, isAttacking: f.isAttacking,
+                attackTimer: f.attackTimer, invulnerableFrames: f.invulnerableFrames,
+                facingRight: f.facingRight, isGrounded: f.isGrounded
+            });
+                isBlocking: f.isBlocking, isCharging: f.isCharging, isDashing: f.isDashing,
+                isFlying: f.isFlying, isAttacking: f.isAttacking,
+                attackTimer: f.attackTimer, invulnerableFrames: f.invulnerableFrames,
+                facingRight: f.facingRight, isGrounded: f.isGrounded
+            });
+            const serProj = (p) => ({
+                x: p.x, y: p.y, vx: p.vx, color: p.color,
+                owner: p.owner === player1 ? 'p1' : 'p2',
+                isUltimate: p.isUltimate, ultType: p.ultType, time: p.time,
+                width: p.width, height: p.height
+            });
+            netSend({
+                t: 'snap',
+                s: {
+                    p1: serFighter(player1),
+                    p2: serFighter(player2),
+                    projectiles: (projectiles || []).map(serProj),
+                    simTick: simTickCounter,
+                    time: Math.ceil(simTimeRemaining / 60)
+                },
+                ts: Date.now()
+            });
+        }
+
+        // ----- Fin de partida -----
+        if (player1.health <= 0 || player2.health <= 0) {
+            if (player1.health <= 0 && player2.health <= 0) endGame('¡EMPATE!', 'draw');
+            else if (player2.health <= 0) endGame(`¡${player1.name.toUpperCase()} GANA!`, 'p1');
+            else endGame(`¡${player2.name.toUpperCase()} GANA!`, 'p2');
+        }
+
+        // ---- Timer (tick fijo: 1 tick = 1/60s, 90s = 5400 ticks) ----
+        simTimeRemaining--;
+        document.getElementById('timer').innerText = Math.max(0, Math.ceil(simTimeRemaining / TICK_FPS));
+        const tEl = document.getElementById('timer');
+        if (simTimeRemaining <= 10 && gameRunning) tEl.classList.add('timer-low');
+        else tEl.classList.remove('timer-low');
+
+        // ---- Si acaba el tiempo en tick, decide por santé ----
+        if (simTimeRemaining === 0 && gameRunning) {
+            if (player1.health === player2.health) endGame('¡TIME OVER — EMPATE!', 'draw');
+            else if (player1.health > player2.health) endGame(`¡TIME OVER — ${player1.name.toUpperCase()} GANA!`, 'p1');
+            else endGame(`¡TIME OVER — ${player2.name.toUpperCase()} GANA!`, 'p2');
+        }
     }
 
-    sendIn();
-
-    handleCollisions(); drawCombos();
-
-    for (let i = 0; i < particlePool.length; i++) {
-        if (particlePool[i].active) { particlePool[i].update(); particlePool[i].draw(); }
-    }
-    ctx.restore();
-
-    if (player1.health <= 0 || player2.health <= 0) {
-        if (player1.health <= 0 && player2.health <= 0) endGame('¡EMPATE!', 'draw');
-        else if (player2.health <= 0) endGame(`¡${player1.name.toUpperCase()} GANA!`, 'p1');
-        else endGame(`¡${player2.name.toUpperCase()} GANA!`, 'p2');
-    }
+    // 3. Solicitar el siguiente frame de render (solo una vez por rAF)
+    requestAnimationFrame(animate);
 }
 
 // ==== Escala para pantallas pequeñas ====
@@ -2899,3 +3297,30 @@ fitGame();
 </script>
 </body>
 </html>
+
+// ==== Fase D: Page Visibility + abort por ocultación / tráfico ----
+document.addEventListener('visibilitychange', () => {
+    if (document.hidden) {
+        hiddenSince = Date.now();
+    } else {
+        hiddenSince = null;
+    }
+});
+
+setInterval(() => {
+    if (!isOnline() || !net) return;
+    lastTraffic = Date.now();
+}, 500);
+
+setInterval(() => {
+    if (!isOnline() || !net || !gameRunning) return;
+    // Abortar si tab oculto > 3s
+    if (hiddenSince && (Date.now() - hiddenSince > 3000)) {
+        endOnlineAborted('TAB OCULTO DEMASIADO TIEMPO — PARTIDA ANULADA');
+        return;
+    }
+    // Abortar si sin tráfico > 10s
+    if ((Date.now() - lastTraffic > 10000)) {
+        endOnlineAborted('DESCONEXIÓN — PARTIDA ANULADA');
+    }
+}, 1000);

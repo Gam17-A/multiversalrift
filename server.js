@@ -22,6 +22,7 @@ const { rateLimit } = require('express-rate-limit');
 const app = express();
 app.set('trust proxy', 1);
 
+// Usar puerto 3000 para pruebas locales; Render y otros entornos usan variables de entorno (PORT).
 const PORT = process.env.PORT || 3000;
 const GAME_FILE = path.join(__dirname, 'index.html');
 
@@ -465,15 +466,25 @@ function setupWebSocket(httpServer) {
     }
 
     ws.on('message', async (data) => {
+      // ---- Fase E: límite de tamaño y tasa ----
+      const maxPayload = 32 * 1024; // 32 KB
+      if (data.length > maxPayload) return send(ws, { t: 'err', msg: 'Mensaje demasiado grande.' });
       let msg;
       try {
         msg = JSON.parse(data.toString());
       } catch {
         return send(ws, { t: 'err', msg: 'Mensaje inválido.' });
       }
+      // Validación básica: debe ser objeto con tipo
+      if (!msg || typeof msg !== 'object' || typeof msg.t !== 'string') return send(ws, { t: 'err', msg: 'Mensaje inválido.' });
+      // Rate limit básico: máximo 60 mensajes/segundo por conexión (simple)
+      const nowTs = Date.now();
+      ws.msgTimestamps = ws.msgTimestamps || [];
+      ws.msgTimestamps = ws.msgTimestamps.filter(ts => nowTs - ts < 1000);
+      if (ws.msgTimestamps.length > 60) return send(ws, { t: 'err', msg: 'Demasiados mensajes.' });
+      ws.msgTimestamps.push(nowTs);
 
       // ---- Auth (primer mensaje obligatorio) ----
-      if (!msg || typeof msg.t !== 'string') return send(ws, { t: 'err', msg: 'Mensaje inválido.' });
       if (msg.t === 'auth') {
         const token = typeof msg.token === 'string' ? msg.token : '';
         const user = await store.findUserByTokenHash(sha256(token));
@@ -546,8 +557,10 @@ function setupWebSocket(httpServer) {
           room.started = true;
           const oppForHost = { ...room.guest.user.pub, char: room.guestChar };
           const oppForGuest = { ...room.host.user.pub, char: room.hostChar };
-          send(room.host, { t: 'start', mode: room.mode, side: 'p1', self: room.host.user.pub, opponent: oppForHost });
-          send(room.guest, { t: 'start', mode: room.mode, side: 'p2', self: room.guest.user.pub, opponent: oppForGuest });
+          const stageName = room.host && room.host.user ? (room.host.user.username ? 'arena' : 'arena') : 'arena';
+          const stageMsg = { t: 'start', mode: room.mode, side: 'p1', self: room.host.user.pub, opponent: oppForHost, stage: 'arena' };
+          send(room.host, stageMsg);
+          send(room.guest, { t: 'start', mode: room.mode, side: 'p2', self: room.guest.user.pub, opponent: oppForGuest, stage: 'arena' });
         }
         return;
       }
@@ -597,6 +610,44 @@ function setupWebSocket(httpServer) {
         }
         handleLeave(room, false); // los dos ya están notificados, no mandar opponent_left
         return;
+      }
+
+      // ---- Loaded (coordinación de inicio) ----
+      if (msg.t === 'loaded') {
+        if (!room || !room.started) return send(ws, { t: 'err', msg: 'No hay partida activa.' });
+        if (!room.gotLoaded) room.gotLoaded = new Set();
+        room.gotLoaded.add(ws === room.host ? 'host' : 'guest');
+        if (room.gotLoaded.has('host') && room.gotLoaded.has('guest')) {
+          send(room.host, { t: 'go' });
+          send(room.guest, { t: 'go' });
+        } else {
+          const peer = ws === room.host ? room.guest : room.host;
+          if (peer) send(peer, { t: 'loaded', from: ws === room.host ? 'host' : 'guest' });
+        }
+        return;
+      }
+
+      // ---- Snapshots del host (solo host envía) ----
+      if (msg.t === 'snap') {
+        if (!room || !room.started || !room.guest) return;
+        if (ws !== room.host) return send(ws, { t: 'err', msg: 'Solo el host envía snapshots.' });
+        const snap = msg.s;
+        if (!snap || typeof snap !== 'object') return send(ws, { t: 'err', msg: 'Snapshot inválido.' });
+        // Validación básica de rango
+        if (Array.isArray(snap.pos)) {
+          for (const p of snap.pos) {
+            if (typeof p.x !== 'number' || typeof p.y !== 'number' || p.x < -100 || p.x > 2000 || p.y < -100 || p.y > 2000) return send(ws, { t: 'err', msg: 'Posición fuera de rango.' });
+          }
+        }
+        return send(room.guest, { t: 'snap', s: snap, ts: msg.ts || Date.now() });
+      }
+
+      // ---- Over (fin del juego por host) ----
+      if (msg.t === 'over') {
+        if (!room || !room.guest) return send(ws, { t: 'err', msg: 'No hay partida activa.' });
+        if (ws !== room.host) return send(ws, { t: 'err', msg: 'Solo host declara fin.' });
+        if (!VALID_RESULTS.has(msg.result)) return send(ws, { t: 'err', msg: 'Resultado inválido.' });
+        return send(room.guest, { t: 'over', result: msg.result });
       }
 
       // ---- Abandonar ----
