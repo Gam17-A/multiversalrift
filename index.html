@@ -3231,11 +3231,7 @@ function animate() {
                 attackTimer: f.attackTimer, invulnerableFrames: f.invulnerableFrames,
                 facingRight: f.facingRight, isGrounded: f.isGrounded
             });
-                isBlocking: f.isBlocking, isCharging: f.isCharging, isDashing: f.isDashing,
-                isFlying: f.isFlying, isAttacking: f.isAttacking,
-                attackTimer: f.attackTimer, invulnerableFrames: f.invulnerableFrames,
-                facingRight: f.facingRight, isGrounded: f.isGrounded
-            });
+
             const serProj = (p) => ({
                 x: p.x, y: p.y, vx: p.vx, color: p.color,
                 owner: p.owner === player1 ? 'p1' : 'p2',
@@ -3321,7 +3317,7 @@ setInterval(() => {
         endOnlineAborted('DESCONEXIÓN — PARTIDA ANULADA');
     }
 }, 1000);
-
+}
 </script>
 </body>
 </html>
